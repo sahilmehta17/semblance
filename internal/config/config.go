@@ -42,6 +42,11 @@ type Config struct {
 	// BackendTimeout bounds a single upstream request. Generous by default
 	// because model completions can be slow.
 	BackendTimeout time.Duration
+
+	// APIKeys are the accepted static bearer tokens for the /v1 routes. If
+	// empty, authentication is disabled ("open mode") — convenient for local
+	// dev, and warned about at startup.
+	APIKeys []string
 }
 
 // Load reads configuration from the environment and validates it.
@@ -85,7 +90,21 @@ func Load() (*Config, error) {
 	}
 	cfg.BackendTimeout = backendTimeout
 
+	cfg.APIKeys = parseKeys(getenv("SEMBLANCE_API_KEYS", ""))
+
 	return cfg, nil
+}
+
+// parseKeys splits a comma-separated key list, trimming whitespace and dropping
+// empty entries. An unset or blank variable yields a nil slice (open mode).
+func parseKeys(raw string) []string {
+	var keys []string
+	for _, k := range strings.Split(raw, ",") {
+		if k = strings.TrimSpace(k); k != "" {
+			keys = append(keys, k)
+		}
+	}
+	return keys
 }
 
 // validateHTTPURL rejects anything that is not an absolute http(s) URL with a

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -55,7 +56,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	upstreamURL := s.cfg.BackendBaseURL + "/chat/completions"
 	upReq, err := http.NewRequestWithContext(ctx, http.MethodPost, upstreamURL, bytes.NewReader(body))
 	if err != nil {
-		s.logAndWriteError(w, http.StatusInternalServerError, "internal_error",
+		s.logAndWriteError(w, r, http.StatusInternalServerError, "internal_error",
 			"failed to build upstream request", err)
 		return
 	}
@@ -65,7 +66,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		// Transport-level failure: backend down, DNS, timeout, client hangup.
 		// 502 Bad Gateway is the honest status; detail goes to the log only.
-		s.logAndWriteError(w, http.StatusBadGateway, "upstream_error",
+		s.logAndWriteError(w, r, http.StatusBadGateway, "upstream_error",
 			"failed to reach the model backend", err)
 		return
 	}
@@ -77,7 +78,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// honor the client's stream:true as a hint.
 	streaming := req.Stream || isEventStream(resp.Header.Get("Content-Type"))
 
-	s.logger.Info("chat completion proxied",
+	s.reqLogger(r).Info("chat completion proxied",
 		"model", req.Model, "upstream_status", resp.StatusCode, "streaming", streaming)
 
 	// Propagate the backend's status and Content-Type. A non-2xx from an
@@ -89,13 +90,13 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(resp.StatusCode)
 
 	if streaming {
-		s.relayStream(w, resp.Body)
+		s.relayStream(s.reqLogger(r), w, resp.Body)
 		return
 	}
 	if _, err := io.Copy(w, resp.Body); err != nil {
 		// The status/headers are already sent, so we can't switch to an error
 		// response; just record that the copy was cut short.
-		s.logger.Warn("response copy interrupted", "err", err)
+		s.reqLogger(r).Warn("response copy interrupted", "err", err)
 	}
 }
 
@@ -125,12 +126,19 @@ func isEventStream(contentType string) bool {
 // with a context derived from the client's request, so a client disconnect
 // cancels that context, which makes the next body.Read return an error and ends
 // the loop. That is how a client hangup stops the upstream call.
-func (s *Server) relayStream(w http.ResponseWriter, body io.Reader) {
-	flusher, canFlush := w.(http.Flusher)
-	if canFlush {
-		// Push the status line and headers out now, so the client opens the
-		// stream instead of waiting for the first body bytes.
-		flusher.Flush()
+//
+// We flush via http.ResponseController rather than a direct w.(http.Flusher)
+// assertion, because w is wrapped by our middleware's responseRecorder; the
+// controller walks the Unwrap() chain to reach the real writer's Flush().
+func (s *Server) relayStream(log *slog.Logger, w http.ResponseWriter, body io.Reader) {
+	rc := http.NewResponseController(w)
+	// Push the status line and headers out now, so the client opens the stream
+	// instead of waiting for the first body bytes. If flushing is unsupported
+	// (some writer with no Flusher in its chain), we still relay correctly —
+	// just buffered — and note it once.
+	flushSupported := rc.Flush() == nil
+	if !flushSupported {
+		log.Debug("streaming without flush support; delivery may be buffered")
 	}
 
 	buf := make([]byte, 4096)
@@ -139,18 +147,18 @@ func (s *Server) relayStream(w http.ResponseWriter, body io.Reader) {
 		if n > 0 {
 			if _, werr := w.Write(buf[:n]); werr != nil {
 				// Writing to the client failed — it went away mid-stream. Stop.
-				s.logger.Debug("client write failed during stream", "err", werr)
+				log.Debug("client write failed during stream", "err", werr)
 				return
 			}
-			if canFlush {
-				flusher.Flush()
+			if flushSupported {
+				_ = rc.Flush()
 			}
 		}
 		if rerr != nil {
 			// io.EOF is the normal end of stream. context.Canceled means the
 			// client disconnected and we cancelled the upstream — also expected.
 			if rerr != io.EOF && !errors.Is(rerr, context.Canceled) {
-				s.logger.Debug("upstream stream ended", "err", rerr)
+				log.Debug("upstream stream ended", "err", rerr)
 			}
 			return
 		}

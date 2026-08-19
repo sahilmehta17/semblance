@@ -11,13 +11,20 @@ import (
 	"github.com/sahilmehta17/semblance/internal/config"
 )
 
-// newTestServer builds a Server whose backend points at backendURL. A discarding
-// logger keeps test output quiet. backendURL may be "" for tests that never
-// reach the backend (e.g. healthz, invalid-JSON).
+// newTestServer builds a Server whose backend points at backendURL, in open
+// mode (no API keys). A discarding logger keeps test output quiet. backendURL
+// may be "" for tests that never reach the backend (e.g. healthz, invalid-JSON).
 func newTestServer(backendURL string) *Server {
+	return newTestServerWithKeys(backendURL)
+}
+
+// newTestServerWithKeys is like newTestServer but configures the given API keys,
+// enabling auth on the /v1 routes.
+func newTestServerWithKeys(backendURL string, keys ...string) *Server {
 	cfg := &config.Config{
 		BackendBaseURL: backendURL,
 		BackendTimeout: 5 * time.Second,
+		APIKeys:        keys,
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	return New(cfg, logger)

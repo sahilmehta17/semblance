@@ -32,8 +32,9 @@ func writeError(w http.ResponseWriter, status int, errType, message string) {
 
 // logAndWriteError logs the underlying detail (which may include internal URLs)
 // and returns a generic message to the client, so we never leak backend
-// topology in a response body.
-func (s *Server) logAndWriteError(w http.ResponseWriter, status int, errType, clientMsg string, detail error) {
-	s.logger.Error("request failed", "type", errType, "status", status, "err", detail)
+// topology in a response body. It logs through the request-scoped logger so the
+// line carries the request ID.
+func (s *Server) logAndWriteError(w http.ResponseWriter, r *http.Request, status int, errType, clientMsg string, detail error) {
+	s.reqLogger(r).Error("request failed", "type", errType, "status", status, "err", detail)
 	writeError(w, status, errType, clientMsg)
 }

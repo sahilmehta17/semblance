@@ -23,6 +23,9 @@ type Server struct {
 // compose with client cancellation and, unlike Client.Timeout, will not fight
 // streaming responses in a later step).
 func New(cfg *config.Config, logger *slog.Logger) *Server {
+	if len(cfg.APIKeys) == 0 {
+		logger.Warn("no API keys configured (SEMBLANCE_API_KEYS); /v1 authentication is DISABLED (open mode)")
+	}
 	return &Server{
 		cfg:    cfg,
 		logger: logger,
@@ -30,13 +33,31 @@ func New(cfg *config.Config, logger *slog.Logger) *Server {
 	}
 }
 
-// Handler returns the router. Routes use Go 1.22+ method-and-path patterns, so
-// a wrong method on a known path yields 405 automatically.
+// Handler returns the router wrapped in the middleware chain.
+//
+// Route/auth layout: the /v1 API sits behind authMiddleware, while /healthz
+// (and any future /readyz added to the root mux) stays reachable without a key.
+// The common middleware — recover, requestID, access logging — wraps everything,
+// so health checks are still logged and panic-safe. Chain order, outermost to
+// innermost: recover → requestID → accessLog → (auth on /v1 only) → handler.
+//
+// Routes use Go 1.22+ method-and-path patterns, so a wrong method on a known
+// path yields 405 automatically.
 func (s *Server) Handler() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", s.handleHealthz)
-	mux.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
-	return mux
+	// The /v1 subtree, guarded by auth.
+	v1 := http.NewServeMux()
+	v1.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
+	authedV1 := s.authMiddleware(v1)
+
+	// Root mux: unauthenticated health plus the guarded /v1 subtree.
+	root := http.NewServeMux()
+	root.HandleFunc("GET /healthz", s.handleHealthz)
+	root.Handle("/v1/", authedV1)
+
+	// Common middleware applied to all routes.
+	return s.recoverMiddleware(
+		s.requestIDMiddleware(
+			s.accessLogMiddleware(root)))
 }
 
 // handleHealthz is a liveness probe: if the process can answer, it is up. It
