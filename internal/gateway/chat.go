@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/sahilmehta17/semblance/internal/openai"
 )
@@ -69,20 +71,88 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
-	s.logger.Info("chat completion proxied",
-		"model", req.Model, "upstream_status", resp.StatusCode)
+	// Decide how to relay. A streaming (SSE) response must be flushed chunk by
+	// chunk; a normal JSON response is copied in one shot. The backend's
+	// Content-Type is the authoritative signal — text/event-stream — and we also
+	// honor the client's stream:true as a hint.
+	streaming := req.Stream || isEventStream(resp.Header.Get("Content-Type"))
 
-	// Pass the response through unchanged: propagate the backend's status and
-	// its Content-Type, then stream the body. A non-2xx from an OpenAI-compatible
-	// backend already carries an OpenAI-shaped error body, so relaying it as-is
-	// is exactly what a client expects.
+	s.logger.Info("chat completion proxied",
+		"model", req.Model, "upstream_status", resp.StatusCode, "streaming", streaming)
+
+	// Propagate the backend's status and Content-Type. A non-2xx from an
+	// OpenAI-compatible backend already carries an OpenAI-shaped error body, so
+	// relaying it as-is is exactly what a client expects.
 	if ct := resp.Header.Get("Content-Type"); ct != "" {
 		w.Header().Set("Content-Type", ct)
 	}
 	w.WriteHeader(resp.StatusCode)
+
+	if streaming {
+		s.relayStream(w, resp.Body)
+		return
+	}
 	if _, err := io.Copy(w, resp.Body); err != nil {
 		// The status/headers are already sent, so we can't switch to an error
 		// response; just record that the copy was cut short.
 		s.logger.Warn("response copy interrupted", "err", err)
+	}
+}
+
+// isEventStream reports whether a Content-Type header denotes Server-Sent
+// Events. The header may carry parameters (e.g. "text/event-stream; charset=utf-8"),
+// so we match on the media type substring.
+func isEventStream(contentType string) bool {
+	return strings.Contains(strings.ToLower(contentType), "text/event-stream")
+}
+
+// relayStream copies the upstream body to the client chunk by chunk, flushing
+// after every write so tokens reach the client as they are produced rather than
+// being buffered until the handler returns.
+//
+// Two idioms here that a Node/TS developer may not have met:
+//
+//   - net/http buffers writes; bytes are not actually sent to the client until
+//     the buffer fills or the handler returns. http.Flusher.Flush() forces them
+//     out immediately, which is what makes SSE feel live. We type-assert the
+//     ResponseWriter to http.Flusher (the stdlib server's writer implements it);
+//     if a wrapper does not, we still deliver correctly — just not incrementally.
+//
+//   - We read into a fixed buffer and write each piece in a loop instead of
+//     io.Copy, because io.Copy gives us no seam to Flush between writes.
+//
+// Cancellation is not handled explicitly here: the upstream request was built
+// with a context derived from the client's request, so a client disconnect
+// cancels that context, which makes the next body.Read return an error and ends
+// the loop. That is how a client hangup stops the upstream call.
+func (s *Server) relayStream(w http.ResponseWriter, body io.Reader) {
+	flusher, canFlush := w.(http.Flusher)
+	if canFlush {
+		// Push the status line and headers out now, so the client opens the
+		// stream instead of waiting for the first body bytes.
+		flusher.Flush()
+	}
+
+	buf := make([]byte, 4096)
+	for {
+		n, rerr := body.Read(buf)
+		if n > 0 {
+			if _, werr := w.Write(buf[:n]); werr != nil {
+				// Writing to the client failed — it went away mid-stream. Stop.
+				s.logger.Debug("client write failed during stream", "err", werr)
+				return
+			}
+			if canFlush {
+				flusher.Flush()
+			}
+		}
+		if rerr != nil {
+			// io.EOF is the normal end of stream. context.Canceled means the
+			// client disconnected and we cancelled the upstream — also expected.
+			if rerr != io.EOF && !errors.Is(rerr, context.Canceled) {
+				s.logger.Debug("upstream stream ended", "err", rerr)
+			}
+			return
+		}
 	}
 }
