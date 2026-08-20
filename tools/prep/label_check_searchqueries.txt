@@ -1,0 +1,34 @@
+rows scanned            : 150000
+
+-- response constancy (are responses placeholders?) --
+distinct response values: 1
+   150000 x 'Not required for the benchmark because of the id_set'
+
+-- id_set cluster structure --
+id_set groups           : 54804
+  singletons (size 1)   : 43564
+  multi-member (size>=2): 11240
+  rows in multi clusters: 106436
+  largest cluster size  : 90
+  size histogram        : 1:43564, 2:2553, 3-5:1767, 6-10:2358, 11+:4562
+
+-- spot check: same id_set should be paraphrases --
+  id_set 5231 (18 members):
+      - directv dropping channels in 2019
+      - direct tv channel lineup 2019 pdf
+      - direct tv channel lineup printable 2019
+  id_set 93691 (25 members):
+      - at&t login account pay bill
+      - att login my account pay my bill
+      - att wireless login pay my bill
+  id_set 145971 (13 members):
+      - email not connecting to server
+      - can't connect to outlook server
+      - cannot connect to smtp server
+
+-- spot check: different id_set should differ --
+  id_set 5231: directv dropping channels in 2019
+  id_set 93691: at&t login account pay bill
+  id_set 145971: email not connecting to server
+
+VERDICT: responses ARE a constant placeholder — scoring MUST rely on id_set, not response text. id_set is a usable clustering: 11240 multi-member clusters give real paraphrase pairs to hit.

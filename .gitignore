@@ -1,2 +1,7 @@
 .env
 .env.*
+
+# Python extraction tooling (tools/prep)
+tools/prep/.venv/
+# Large extracted datasets — never commit multi-GB data. Samples/ is committed.
+tools/prep/out/

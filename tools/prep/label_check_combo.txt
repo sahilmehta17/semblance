@@ -1,0 +1,17 @@
+rows scanned          : 27500
+(dataset, ID_Set) groups: 3529
+impure groups (>1 distinct response): 26
+  of which negative ID_Set          : 26
+worst impure groups (dataset, ID_Set) -> distinct responses:
+  ('commonsense_qa', -8) -> 16
+  ('commonsense_qa', -7) -> 14
+  ('commonsense_qa', -16) -> 9
+  ('commonsense_qa', -11) -> 8
+  ('commonsense_qa', -9) -> 7
+  ('commonsense_qa', -13) -> 7
+  ('commonsense_qa', -17) -> 7
+  ('commonsense_qa', -14) -> 6
+  ('commonsense_qa', -23) -> 6
+  ('commonsense_qa', -29) -> 5
+
+VERDICT: labels UNRELIABLE — some ID_Set groups span multiple distinct answers, so ID_Set is NOT a clean correctness label. Use DEV-LOOP ONLY; do not use for any published number.
