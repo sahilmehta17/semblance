@@ -5,31 +5,97 @@ package gateway
 
 import (
 	"log/slog"
+	"math/rand"
 	"net/http"
+	"sync/atomic"
 
+	"github.com/sahilmehta17/semblance/internal/cache"
 	"github.com/sahilmehta17/semblance/internal/config"
+	"github.com/sahilmehta17/semblance/internal/embed"
+	"github.com/sahilmehta17/semblance/internal/judge"
+	"github.com/sahilmehta17/semblance/internal/policy"
 )
 
-// Server holds the dependencies every handler shares: configuration, a logger,
-// and the HTTP client used to talk to the upstream backend.
+// Server holds the dependencies every handler shares. The verified-cache
+// dependencies (embedder, store, policy, labeler) are injectable via options so
+// tests can wire deterministic fakes and production wires real implementations.
 type Server struct {
 	cfg    *config.Config
 	logger *slog.Logger
 	client *http.Client
+
+	embedder embed.Embedder // nil disables caching (pure passthrough)
+	store    cache.Store
+	policy   *policy.Policy
+	labeler  *judge.Labeler
+
+	bypassTotal atomic.Int64
 }
 
-// New builds a Server. The HTTP client intentionally has no global timeout; we
-// bound each upstream call with a per-request context instead (context timeouts
-// compose with client cancellation and, unlike Client.Timeout, will not fight
-// streaming responses in a later step).
-func New(cfg *config.Config, logger *slog.Logger) *Server {
+// Option customizes a Server at construction (used mainly by tests).
+type Option func(*Server)
+
+// WithEmbedder injects the embedder (e.g. a deterministic fake in tests).
+func WithEmbedder(e embed.Embedder) Option { return func(s *Server) { s.embedder = e } }
+
+// WithStore injects the cache store.
+func WithStore(st cache.Store) Option { return func(s *Server) { s.store = st } }
+
+// WithPolicy injects a fully-built policy (e.g. with a deterministic RNG).
+func WithPolicy(p *policy.Policy) Option { return func(s *Server) { s.policy = p } }
+
+// WithLabeler injects the async labeler.
+func WithLabeler(l *judge.Labeler) Option { return func(s *Server) { s.labeler = l } }
+
+// stdRand adapts the standard library's concurrency-safe global RNG to
+// policy.Rand for production use.
+type stdRand struct{}
+
+func (stdRand) Float64() float64 { return rand.Float64() }
+
+// New builds a Server with production defaults, then applies options. The HTTP
+// client has no global timeout; each upstream call is bounded by a per-request
+// context so streaming is not cut short by a client-wide deadline.
+func New(cfg *config.Config, logger *slog.Logger, opts ...Option) *Server {
 	if len(cfg.APIKeys) == 0 {
 		logger.Warn("no API keys configured (SEMBLANCE_API_KEYS); /v1 authentication is DISABLED (open mode)")
 	}
-	return &Server{
+	s := &Server{
 		cfg:    cfg,
 		logger: logger,
 		client: &http.Client{},
+	}
+	// Apply options first, then fill only the dependencies still unset — so an
+	// injected store/policy/labeler never triggers construction of a default
+	// one (which for the labeler would leak goroutines).
+	for _, opt := range opts {
+		opt(s)
+	}
+	if s.store == nil {
+		s.store = cache.NewMemoryStore(cfg.CacheCapacity, cfg.MaxObservations, cfg.CacheShards, 1)
+	}
+	if s.policy == nil {
+		s.policy = policy.NewPolicy(cfg.Delta, stdRand{})
+	}
+	if s.labeler == nil {
+		s.labeler = judge.NewLabeler(judge.NewDefaultJudge(nil), cfg.JudgeQueueSize, cfg.JudgeWorkers, logger)
+	}
+	if s.embedder == nil {
+		logger.Warn("no embedder configured (set OPENAI_API_KEY); semantic caching DISABLED (passthrough only)")
+	}
+	return s
+}
+
+// BypassTotal returns the number of requests that skipped the cache. This is a
+// placeholder counter until Step 9 replaces it with a Prometheus metric.
+func (s *Server) BypassTotal() int64 { return s.bypassTotal.Load() }
+
+// Close releases background resources (the async labeler's workers). Call it
+// during graceful shutdown, after the HTTP server has stopped accepting new
+// requests so nothing submits to a closed queue.
+func (s *Server) Close() {
+	if s.labeler != nil {
+		s.labeler.Close()
 	}
 }
 

@@ -8,8 +8,11 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 
+	"github.com/sahilmehta17/semblance/internal/cache"
+	"github.com/sahilmehta17/semblance/internal/judge"
 	"github.com/sahilmehta17/semblance/internal/openai"
 )
 
@@ -17,73 +20,264 @@ import (
 // use from a hostile or buggy caller. 10 MiB is far above any real chat body.
 const maxRequestBytes = 10 << 20
 
-// handleChatCompletions is the Step 2 non-streaming passthrough. It reads the
-// client's request, forwards the ORIGINAL bytes to the backend, and copies the
-// backend's response back unchanged. Forwarding raw bytes (rather than
-// re-encoding a parsed struct) is what guarantees no client parameter is ever
-// dropped — see the internal/openai package doc.
+// Response headers that expose the cache decision to clients and tests.
+const (
+	headerCache      = "X-Semblance-Cache"      // hit | miss | bypass
+	headerSimilarity = "X-Semblance-Similarity" // cosine to nearest neighbor
+	headerTau        = "X-Semblance-Tau"        // exploration probability used
+)
+
+const (
+	cacheHit    = "hit"
+	cacheMiss   = "miss"
+	cacheBypass = "bypass"
+)
+
+// handleChatCompletions is the verified-cache decision path.
 //
-// Streaming (stream=true) is Step 3; this handler simply relays whatever the
-// backend returns without incremental flushing.
+// Shape of the logic:
+//  1. Validate the body. Forwarding always uses the ORIGINAL bytes, so unknown
+//     client fields are never dropped.
+//  2. Bypass (no caching) for streaming, tools/functions, n>1, or temperature
+//     above the ceiling — or when no embedder is configured.
+//  3. Otherwise embed the final user turn, find the nearest neighbor within the
+//     exact-match bucket, and ask the policy to EXPLORE or EXPLOIT.
+//  4. EXPLOIT serves the cached answer; EXPLORE proxies to the backend, then
+//     asynchronously labels equivalence and updates the cache (Algorithm 1).
 func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
-	// Read the full body, capped. MaxBytesReader makes an over-large body fail
-	// here instead of ballooning memory.
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBytes))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request_error", "could not read request body")
 		return
 	}
-
-	// Validate that the body is JSON at all. We do NOT strictly decode into our
-	// struct for validation, because that could reject an unusual-but-valid
-	// request the backend would accept; json.Valid is the lenient check.
 	if !json.Valid(body) {
 		writeError(w, http.StatusBadRequest, "invalid_request_error", "request body is not valid JSON")
 		return
 	}
 
-	// Best-effort decode purely for logging/inspection. Errors are ignored: the
-	// body is already known to be valid JSON, and the forwarded bytes are the
-	// original regardless of what we manage to parse.
+	// Best-effort decode for inspection; forwarding uses the original bytes.
 	var req openai.ChatCompletionRequest
 	_ = json.Unmarshal(body, &req)
 
-	// Bound the upstream call with a context derived from the request, so a
-	// client disconnect (r.Context() cancelled) or our timeout both abort it.
+	// Caching entirely disabled (no embedder) → pure passthrough.
+	if s.embedder == nil {
+		w.Header().Set(headerCache, cacheBypass)
+		s.proxyPassthrough(w, r, body, &req)
+		return
+	}
+
+	// Bypass for request shapes we do not (or cannot) cache.
+	if reason := s.bypassReason(&req); reason != "" {
+		s.bypassTotal.Add(1)
+		s.reqLogger(r).Debug("cache bypass", "reason", reason)
+		w.Header().Set(headerCache, cacheBypass)
+		s.proxyPassthrough(w, r, body, &req)
+		return
+	}
+
+	finalText, _ := finalUserText(&req) // bypassReason guaranteed this is present
+	bucket := bucketKeyForRequest(&req)
+
+	qvec, err := s.embedder.Embed(r.Context(), finalText)
+	if err != nil {
+		// Can't embed → can't cache. Fall back to a plain proxied miss.
+		s.reqLogger(r).Warn("embed failed; passthrough without caching", "err", err)
+		w.Header().Set(headerCache, cacheMiss)
+		s.proxyPassthrough(w, r, body, &req)
+		return
+	}
+
+	match, found := s.store.Nearest(bucket, qvec)
+	if !found {
+		s.exploreColdMiss(w, r, body, bucket, qvec)
+		return
+	}
+
+	// A neighbor exists: let the policy decide. Decide() draws u internally
+	// from the injected RNG, so this single call covers "get tau_hat, draw u,
+	// explore-or-exploit".
+	decision := s.policy.Decide(match.Observations, match.Similarity)
+	w.Header().Set(headerSimilarity, formatFloat(match.Similarity))
+	w.Header().Set(headerTau, formatFloat(decision.Tau))
+
+	if decision.Explore {
+		s.exploreWithNeighbor(w, r, body, bucket, qvec, match)
+		return
+	}
+	s.serveHit(w, r, match)
+}
+
+// serveHit returns the cached response (EXPLOIT). Learning happens only on
+// EXPLORE, so we do not record an observation here.
+func (s *Server) serveHit(w http.ResponseWriter, r *http.Request, match cache.Match) {
+	w.Header().Set(headerCache, cacheHit)
+	ct := match.Response.ContentType
+	if ct == "" {
+		ct = "application/json"
+	}
+	w.Header().Set("Content-Type", ct)
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(match.Response.Body)
+	s.reqLogger(r).Info("cache hit", "similarity", match.Similarity)
+}
+
+// exploreColdMiss handles an empty bucket: there is no neighbor, so we must
+// call the backend and (on success) insert this prompt as the bucket's first
+// entry — unconditionally, since there is nothing to guard against.
+func (s *Server) exploreColdMiss(w http.ResponseWriter, r *http.Request, body []byte, bucket string, qvec []float32) {
+	w.Header().Set(headerCache, cacheMiss)
+	w.Header().Set(headerTau, "1") // forced explore (cold start), no neighbor
+
+	res, err := s.fetchUpstreamBuffered(r, body)
+	if err != nil {
+		s.logAndWriteError(w, r, http.StatusBadGateway, "upstream_error", "failed to reach the model backend", err)
+		return
+	}
+	s.writeBuffered(w, res)
+
+	if res.cacheable() {
+		s.store.Insert(bucket, qvec, cache.StoredResponse{
+			Body:        res.body,
+			ContentType: res.contentType,
+			Content:     extractContent(res.body),
+		})
+	}
+}
+
+// exploreWithNeighbor handles a MISS where a neighbor exists: proxy to the
+// backend, return the fresh answer, then asynchronously label whether the
+// neighbor's answer would have been correct and update the cache per
+// Algorithm 1 (append observation; guarded-insert only when the neighbor was
+// wrong).
+func (s *Server) exploreWithNeighbor(w http.ResponseWriter, r *http.Request, body []byte, bucket string, qvec []float32, match cache.Match) {
+	w.Header().Set(headerCache, cacheMiss)
+
+	res, err := s.fetchUpstreamBuffered(r, body)
+	if err != nil {
+		s.logAndWriteError(w, r, http.StatusBadGateway, "upstream_error", "failed to reach the model backend", err)
+		return
+	}
+	s.writeBuffered(w, res)
+
+	if !res.cacheable() {
+		return
+	}
+	newResp := cache.StoredResponse{
+		Body:        res.body,
+		ContentType: res.contentType,
+		Content:     extractContent(res.body),
+	}
+	// Capture values for the async closure (avoid capturing the request).
+	entryID, sim := match.EntryID, match.Similarity
+	reference := match.Response.Content
+
+	// Off the critical path: judge equivalence, then record the observation and
+	// guarded-insert. Dropped if the queue is full (safe: we just learn less).
+	s.labeler.Submit(judge.Job{
+		Reference: reference,
+		Candidate: newResp.Content,
+		OnResult: func(equivalent bool) {
+			s.store.Observe(bucket, entryID, sim, equivalent)
+			cache.GuardedInsert(s.store, bucket, qvec, newResp, equivalent)
+		},
+	})
+}
+
+// bypassReason returns why a request cannot be cached, or "" if it is
+// cacheable. High-temperature, streaming, multi-choice, and tool-using requests
+// are not safely cacheable.
+func (s *Server) bypassReason(req *openai.ChatCompletionRequest) string {
+	switch {
+	case req.Stream:
+		return "stream"
+	case len(req.Tools) > 0:
+		return "tools"
+	case len(req.Functions) > 0:
+		return "functions"
+	case req.N != nil && *req.N > 1:
+		return "n>1"
+	case req.Temperature != nil && *req.Temperature > s.cfg.TemperatureCeiling:
+		return "temperature"
+	}
+	if _, ok := finalUserText(req); !ok {
+		return "no_user_turn"
+	}
+	return ""
+}
+
+// --- upstream helpers ---
+
+// upstreamResult is a buffered (non-streaming) backend response.
+type upstreamResult struct {
+	status      int
+	contentType string
+	body        []byte
+}
+
+// cacheable reports whether this response should be stored/learned from: a
+// successful, non-empty completion.
+func (u *upstreamResult) cacheable() bool {
+	return u.status >= 200 && u.status < 300 && len(u.body) > 0
+}
+
+// fetchUpstreamBuffered performs the backend call and reads the full response.
+// Used on the cache paths (which are always non-streaming — streaming bypasses).
+func (s *Server) fetchUpstreamBuffered(r *http.Request, body []byte) (*upstreamResult, error) {
 	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.BackendTimeout)
 	defer cancel()
 
-	upstreamURL := s.cfg.BackendBaseURL + "/chat/completions"
-	upReq, err := http.NewRequestWithContext(ctx, http.MethodPost, upstreamURL, bytes.NewReader(body))
+	upReq, err := http.NewRequestWithContext(ctx, http.MethodPost, s.cfg.BackendBaseURL+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
-		s.logAndWriteError(w, r, http.StatusInternalServerError, "internal_error",
-			"failed to build upstream request", err)
+		return nil, err
+	}
+	upReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := s.client.Do(upReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	return &upstreamResult{status: resp.StatusCode, contentType: resp.Header.Get("Content-Type"), body: b}, nil
+}
+
+// writeBuffered relays a buffered upstream response to the client.
+func (s *Server) writeBuffered(w http.ResponseWriter, res *upstreamResult) {
+	if res.contentType != "" {
+		w.Header().Set("Content-Type", res.contentType)
+	}
+	w.WriteHeader(res.status)
+	_, _ = w.Write(res.body)
+}
+
+// proxyPassthrough forwards the original request bytes and relays the response,
+// streaming (SSE) chunk-by-chunk when appropriate. Used for bypassed requests.
+func (s *Server) proxyPassthrough(w http.ResponseWriter, r *http.Request, body []byte, req *openai.ChatCompletionRequest) {
+	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.BackendTimeout)
+	defer cancel()
+
+	upReq, err := http.NewRequestWithContext(ctx, http.MethodPost, s.cfg.BackendBaseURL+"/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		s.logAndWriteError(w, r, http.StatusInternalServerError, "internal_error", "failed to build upstream request", err)
 		return
 	}
 	upReq.Header.Set("Content-Type", "application/json")
 
 	resp, err := s.client.Do(upReq)
 	if err != nil {
-		// Transport-level failure: backend down, DNS, timeout, client hangup.
-		// 502 Bad Gateway is the honest status; detail goes to the log only.
-		s.logAndWriteError(w, r, http.StatusBadGateway, "upstream_error",
-			"failed to reach the model backend", err)
+		s.logAndWriteError(w, r, http.StatusBadGateway, "upstream_error", "failed to reach the model backend", err)
 		return
 	}
 	defer resp.Body.Close()
 
-	// Decide how to relay. A streaming (SSE) response must be flushed chunk by
-	// chunk; a normal JSON response is copied in one shot. The backend's
-	// Content-Type is the authoritative signal — text/event-stream — and we also
-	// honor the client's stream:true as a hint.
 	streaming := req.Stream || isEventStream(resp.Header.Get("Content-Type"))
-
 	s.reqLogger(r).Info("chat completion proxied",
 		"model", req.Model, "upstream_status", resp.StatusCode, "streaming", streaming)
 
-	// Propagate the backend's status and Content-Type. A non-2xx from an
-	// OpenAI-compatible backend already carries an OpenAI-shaped error body, so
-	// relaying it as-is is exactly what a client expects.
 	if ct := resp.Header.Get("Content-Type"); ct != "" {
 		w.Header().Set("Content-Type", ct)
 	}
@@ -94,48 +288,25 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, err := io.Copy(w, resp.Body); err != nil {
-		// The status/headers are already sent, so we can't switch to an error
-		// response; just record that the copy was cut short.
 		s.reqLogger(r).Warn("response copy interrupted", "err", err)
 	}
 }
 
-// isEventStream reports whether a Content-Type header denotes Server-Sent
-// Events. The header may carry parameters (e.g. "text/event-stream; charset=utf-8"),
-// so we match on the media type substring.
+// isEventStream reports whether a Content-Type header denotes Server-Sent Events.
 func isEventStream(contentType string) bool {
 	return strings.Contains(strings.ToLower(contentType), "text/event-stream")
 }
 
 // relayStream copies the upstream body to the client chunk by chunk, flushing
-// after every write so tokens reach the client as they are produced rather than
-// being buffered until the handler returns.
-//
-// Two idioms here that a Node/TS developer may not have met:
-//
-//   - net/http buffers writes; bytes are not actually sent to the client until
-//     the buffer fills or the handler returns. http.Flusher.Flush() forces them
-//     out immediately, which is what makes SSE feel live. We type-assert the
-//     ResponseWriter to http.Flusher (the stdlib server's writer implements it);
-//     if a wrapper does not, we still deliver correctly — just not incrementally.
-//
-//   - We read into a fixed buffer and write each piece in a loop instead of
-//     io.Copy, because io.Copy gives us no seam to Flush between writes.
-//
-// Cancellation is not handled explicitly here: the upstream request was built
-// with a context derived from the client's request, so a client disconnect
-// cancels that context, which makes the next body.Read return an error and ends
-// the loop. That is how a client hangup stops the upstream call.
+// after every write so tokens reach the client as they are produced.
 //
 // We flush via http.ResponseController rather than a direct w.(http.Flusher)
-// assertion, because w is wrapped by our middleware's responseRecorder; the
+// assertion, because w is wrapped by the middleware's responseRecorder; the
 // controller walks the Unwrap() chain to reach the real writer's Flush().
+// Cancellation is implicit: the upstream context derives from the client's
+// request, so a client disconnect cancels it and the next Read returns an error.
 func (s *Server) relayStream(log *slog.Logger, w http.ResponseWriter, body io.Reader) {
 	rc := http.NewResponseController(w)
-	// Push the status line and headers out now, so the client opens the stream
-	// instead of waiting for the first body bytes. If flushing is unsupported
-	// (some writer with no Flusher in its chain), we still relay correctly —
-	// just buffered — and note it once.
 	flushSupported := rc.Flush() == nil
 	if !flushSupported {
 		log.Debug("streaming without flush support; delivery may be buffered")
@@ -146,7 +317,6 @@ func (s *Server) relayStream(log *slog.Logger, w http.ResponseWriter, body io.Re
 		n, rerr := body.Read(buf)
 		if n > 0 {
 			if _, werr := w.Write(buf[:n]); werr != nil {
-				// Writing to the client failed — it went away mid-stream. Stop.
 				log.Debug("client write failed during stream", "err", werr)
 				return
 			}
@@ -155,12 +325,97 @@ func (s *Server) relayStream(log *slog.Logger, w http.ResponseWriter, body io.Re
 			}
 		}
 		if rerr != nil {
-			// io.EOF is the normal end of stream. context.Canceled means the
-			// client disconnected and we cancelled the upstream — also expected.
 			if rerr != io.EOF && !errors.Is(rerr, context.Canceled) {
 				log.Debug("upstream stream ended", "err", rerr)
 			}
 			return
 		}
 	}
+}
+
+// --- request/response helpers ---
+
+// bucketKeyForRequest builds the exact-match bucket key. Everything that must
+// isolate cache entries goes in: model, system prompt, sampling params, and all
+// prior turns. Only the FINAL user turn is matched semantically (via embedding),
+// so it is deliberately excluded from the key.
+func bucketKeyForRequest(req *openai.ChatCompletionRequest) string {
+	parts := []string{
+		req.Model,
+		systemPrompt(req),
+		floatPtrString(req.Temperature),
+		floatPtrString(req.TopP),
+	}
+	// Prior messages = all but the final turn.
+	for i := 0; i < len(req.Messages)-1; i++ {
+		m := req.Messages[i]
+		txt, _ := messageText(m.Content)
+		parts = append(parts, m.Role, txt)
+	}
+	return cache.BucketKey(parts...)
+}
+
+// systemPrompt concatenates the text of all system messages.
+func systemPrompt(req *openai.ChatCompletionRequest) string {
+	var b strings.Builder
+	for _, m := range req.Messages {
+		if m.Role == "system" {
+			if txt, ok := messageText(m.Content); ok {
+				b.WriteString(txt)
+				b.WriteByte('\n')
+			}
+		}
+	}
+	return b.String()
+}
+
+// finalUserText returns the text of the final turn, ok only if it is a user
+// turn with plain-string content (what we can embed).
+func finalUserText(req *openai.ChatCompletionRequest) (string, bool) {
+	if len(req.Messages) == 0 {
+		return "", false
+	}
+	last := req.Messages[len(req.Messages)-1]
+	if last.Role != "user" {
+		return "", false
+	}
+	return messageText(last.Content)
+}
+
+// messageText decodes message content. OpenAI content may be a plain string or
+// an array of typed parts; we return (string, true) only for the plain-string
+// form, and (rawJSON, false) otherwise so callers can decide.
+func messageText(raw json.RawMessage) (string, bool) {
+	if len(raw) == 0 {
+		return "", false
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s, true
+	}
+	return string(raw), false
+}
+
+// extractContent pulls the assistant's answer text out of a completion response
+// body, for equivalence labeling.
+func extractContent(body []byte) string {
+	var resp openai.ChatCompletionResponse
+	if err := json.Unmarshal(body, &resp); err != nil || len(resp.Choices) == 0 {
+		return ""
+	}
+	if txt, ok := messageText(resp.Choices[0].Message.Content); ok {
+		return txt
+	}
+	return string(resp.Choices[0].Message.Content)
+}
+
+func floatPtrString(f *float64) string {
+	if f == nil {
+		return ""
+	}
+	return formatFloat(*f)
+}
+
+func formatFloat(f float64) string {
+	return strconv.FormatFloat(f, 'f', 4, 64)
 }

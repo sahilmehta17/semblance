@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/sahilmehta17/semblance/internal/config"
+	"github.com/sahilmehta17/semblance/internal/embed"
 	"github.com/sahilmehta17/semblance/internal/gateway"
 )
 
@@ -56,9 +57,20 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Build the gateway. An embedder is constructed only when an OpenAI API key
+	// is present; without one, semantic caching is disabled and the gateway is a
+	// pure passthrough (New logs a warning to that effect).
+	var gwOpts []gateway.Option
+	if cfg.OpenAIAPIKey != "" {
+		gwOpts = append(gwOpts, gateway.WithEmbedder(embed.NewOpenAI(
+			cfg.EmbedBaseURL, cfg.OpenAIAPIKey, cfg.EmbedModel, cfg.EmbedDimensions, nil)))
+	}
+	gw := gateway.New(cfg, logger, gwOpts...)
+	defer gw.Close() // drain the async labeler on shutdown
+
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
-		Handler:           gateway.New(cfg, logger).Handler(),
+		Handler:           gw.Handler(),
 		ReadHeaderTimeout: 10 * time.Second, // basic slow-client protection
 	}
 

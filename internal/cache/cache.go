@@ -31,9 +31,14 @@ import (
 // StoredResponse is what we serve on a cache hit: the response body bytes and
 // its content type. Status is assumed 200 (only successful completions are
 // cached).
+//
+// Content is the extracted assistant answer text, kept separately for
+// equivalence labeling: comparing whole response bodies would always differ
+// (ids, timestamps), so the judge compares Content, not Body.
 type StoredResponse struct {
 	Body        []byte
 	ContentType string
+	Content     string
 }
 
 // Match is a race-safe SNAPSHOT of the nearest entry. It intentionally returns

@@ -9,25 +9,54 @@ import (
 	"time"
 
 	"github.com/sahilmehta17/semblance/internal/config"
+	"github.com/sahilmehta17/semblance/internal/embed"
+	"github.com/sahilmehta17/semblance/internal/judge"
+	"github.com/sahilmehta17/semblance/internal/policy"
 )
 
-// newTestServer builds a Server whose backend points at backendURL, in open
-// mode (no API keys). A discarding logger keeps test output quiet. backendURL
-// may be "" for tests that never reach the backend (e.g. healthz, invalid-JSON).
+// fixedRand is a deterministic policy.Rand for tests: it always returns v, so
+// the explore/exploit coin flip is controllable.
+type fixedRand float64
+
+func (f fixedRand) Float64() float64 { return float64(f) }
+
+// testLogger is a discarding logger to keep test output quiet.
+func testLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+// testConfig returns a Config with sane cache defaults for tests.
+func testConfig(backendURL string, keys ...string) *config.Config {
+	return &config.Config{
+		BackendBaseURL:     backendURL,
+		BackendTimeout:     5 * time.Second,
+		APIKeys:            keys,
+		Delta:              0.05,
+		TemperatureCeiling: 0.3,
+		CacheCapacity:      1000,
+		MaxObservations:    128,
+		CacheShards:        4,
+		JudgeQueueSize:     64,
+		JudgeWorkers:       2,
+	}
+}
+
+// newTestServer builds a Server with the deterministic fake embedder, in open
+// mode (no API keys). backendURL may be "" for tests that never reach it.
 func newTestServer(backendURL string) *Server {
 	return newTestServerWithKeys(backendURL)
 }
 
-// newTestServerWithKeys is like newTestServer but configures the given API keys,
-// enabling auth on the /v1 routes.
+// newTestServerWithKeys is like newTestServer but configures API keys (enabling
+// /v1 auth). The exploit coin flip is pinned to 0.999 (exploit unless tau≈1).
 func newTestServerWithKeys(backendURL string, keys ...string) *Server {
-	cfg := &config.Config{
-		BackendBaseURL: backendURL,
-		BackendTimeout: 5 * time.Second,
-		APIKeys:        keys,
-	}
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return New(cfg, logger)
+	logger := testLogger()
+	cfg := testConfig(backendURL, keys...)
+	return New(cfg, logger,
+		WithEmbedder(embed.NewFake(256)),
+		WithPolicy(policy.NewPolicy(cfg.Delta, fixedRand(0.999))),
+		WithLabeler(judge.NewLabeler(judge.NewDefaultJudge(nil), 64, 2, logger)),
+	)
 }
 
 func TestHealthz(t *testing.T) {

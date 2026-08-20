@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -47,6 +48,32 @@ type Config struct {
 	// empty, authentication is disabled ("open mode") — convenient for local
 	// dev, and warned about at startup.
 	APIKeys []string
+
+	// --- Verified-cache settings ---
+
+	// Delta is the policy's error budget (the only real hyperparameter).
+	Delta float64
+	// TemperatureCeiling: requests above this temperature bypass the cache
+	// (high randomness makes a cached answer unreliable).
+	TemperatureCeiling float64
+	// CacheCapacity is the max number of cache entries (LRU-evicted).
+	CacheCapacity int
+	// MaxObservations caps observations per entry (reservoir-sampled).
+	MaxObservations int
+	// CacheShards is the number of lock-striped shards.
+	CacheShards int
+	// JudgeQueueSize and JudgeWorkers configure async labeling.
+	JudgeQueueSize int
+	JudgeWorkers   int
+
+	// --- Embedding provider (live demo only; tests use a fake) ---
+
+	// OpenAIAPIKey is the key for the embeddings API. If empty, no embedder is
+	// constructed and caching is disabled (pure passthrough).
+	OpenAIAPIKey    string
+	EmbedBaseURL    string
+	EmbedModel      string
+	EmbedDimensions int
 }
 
 // Load reads configuration from the environment and validates it.
@@ -92,7 +119,65 @@ func Load() (*Config, error) {
 
 	cfg.APIKeys = parseKeys(getenv("SEMBLANCE_API_KEYS", ""))
 
+	// Verified-cache settings.
+	if cfg.Delta, err = parseFloat("SEMBLANCE_DELTA", "0.02"); err != nil {
+		return nil, err
+	}
+	if cfg.Delta <= 0 || cfg.Delta >= 1 {
+		return nil, fmt.Errorf("SEMBLANCE_DELTA: must be in (0,1), got %v", cfg.Delta)
+	}
+	if cfg.TemperatureCeiling, err = parseFloat("SEMBLANCE_TEMPERATURE_CEILING", "0.3"); err != nil {
+		return nil, err
+	}
+	if cfg.TemperatureCeiling < 0 {
+		return nil, fmt.Errorf("SEMBLANCE_TEMPERATURE_CEILING: must be >= 0")
+	}
+	if cfg.CacheCapacity, err = parsePositiveInt("SEMBLANCE_CACHE_CAPACITY", "10000"); err != nil {
+		return nil, err
+	}
+	if cfg.MaxObservations, err = parsePositiveInt("SEMBLANCE_MAX_OBSERVATIONS", "200"); err != nil {
+		return nil, err
+	}
+	if cfg.CacheShards, err = parsePositiveInt("SEMBLANCE_CACHE_SHARDS", "16"); err != nil {
+		return nil, err
+	}
+	if cfg.JudgeQueueSize, err = parsePositiveInt("SEMBLANCE_JUDGE_QUEUE", "1000"); err != nil {
+		return nil, err
+	}
+	if cfg.JudgeWorkers, err = parsePositiveInt("SEMBLANCE_JUDGE_WORKERS", "4"); err != nil {
+		return nil, err
+	}
+
+	// Embedding provider (demo only).
+	cfg.OpenAIAPIKey = os.Getenv("OPENAI_API_KEY")
+	cfg.EmbedBaseURL = strings.TrimRight(getenv("SEMBLANCE_EMBED_URL", "https://api.openai.com/v1"), "/")
+	cfg.EmbedModel = getenv("SEMBLANCE_EMBED_MODEL", "text-embedding-3-small")
+	if cfg.EmbedDimensions, err = parsePositiveInt("SEMBLANCE_EMBED_DIMENSIONS", "1536"); err != nil {
+		return nil, err
+	}
+
 	return cfg, nil
+}
+
+// parseFloat reads a float env var with a default, wrapping parse errors.
+func parseFloat(key, fallback string) (float64, error) {
+	v, err := strconv.ParseFloat(getenv(key, fallback), 64)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %w", key, err)
+	}
+	return v, nil
+}
+
+// parsePositiveInt reads an int env var with a default and requires it be > 0.
+func parsePositiveInt(key, fallback string) (int, error) {
+	v, err := strconv.Atoi(getenv(key, fallback))
+	if err != nil {
+		return 0, fmt.Errorf("%s: %w", key, err)
+	}
+	if v <= 0 {
+		return 0, fmt.Errorf("%s: must be > 0, got %d", key, v)
+	}
+	return v, nil
 }
 
 // parseKeys splits a comma-separated key list, trimming whitespace and dropping
