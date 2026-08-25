@@ -54,7 +54,7 @@ func TestEndToEndGatewayCacheFlow(t *testing.T) {
 	helpfulBucket := bucketKeyForRequest(&hr)
 
 	// The stored vector is the same tokens reordered → cosine 1.0 with the query.
-	entryVec, _ := fake.Embed(context.Background(), "the capital of france please tell me")
+	entryVec, _, _ := fake.Embed(context.Background(), "the capital of france please tell me")
 	id := store.Insert(helpfulBucket, entryVec, cache.StoredResponse{
 		Body: []byte(cachedBody), ContentType: "application/json", Content: "Paris",
 	})

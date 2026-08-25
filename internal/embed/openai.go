@@ -39,24 +39,28 @@ type embeddingResponse struct {
 	Data []struct {
 		Embedding []float32 `json:"embedding"`
 	} `json:"data"`
+	Usage struct {
+		PromptTokens int `json:"prompt_tokens"`
+		TotalTokens  int `json:"total_tokens"`
+	} `json:"usage"`
 }
 
-func (o *OpenAI) Embed(ctx context.Context, text string) ([]float32, error) {
+func (o *OpenAI) Embed(ctx context.Context, text string) ([]float32, int, error) {
 	body, err := json.Marshal(embeddingRequest{Model: o.model, Input: text})
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, o.baseURL+"/embeddings", bytes.NewReader(body))
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+o.apiKey)
 
 	resp, err := o.client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer resp.Body.Close()
 
@@ -64,17 +68,23 @@ func (o *OpenAI) Embed(ctx context.Context, text string) ([]float32, error) {
 	if resp.StatusCode != http.StatusOK {
 		// Surface a trimmed body so demo failures are diagnosable, without
 		// dumping an unbounded response into an error string.
-		return nil, fmt.Errorf("embeddings API status %d: %s", resp.StatusCode, trim(raw, 256))
+		return nil, 0, fmt.Errorf("embeddings API status %d: %s", resp.StatusCode, trim(raw, 256))
 	}
 
 	var out embeddingResponse
 	if err := json.Unmarshal(raw, &out); err != nil {
-		return nil, fmt.Errorf("decode embeddings response: %w", err)
+		return nil, 0, fmt.Errorf("decode embeddings response: %w", err)
 	}
 	if len(out.Data) == 0 || len(out.Data[0].Embedding) == 0 {
-		return nil, fmt.Errorf("embeddings API returned no embedding")
+		return nil, 0, fmt.Errorf("embeddings API returned no embedding")
 	}
-	return out.Data[0].Embedding, nil
+	// prompt_tokens is the billed count for an embeddings request (total_tokens
+	// equals it for embeddings); fall back to total if prompt is absent.
+	tokens := out.Usage.PromptTokens
+	if tokens == 0 {
+		tokens = out.Usage.TotalTokens
+	}
+	return out.Data[0].Embedding, tokens, nil
 }
 
 func trim(b []byte, n int) string {

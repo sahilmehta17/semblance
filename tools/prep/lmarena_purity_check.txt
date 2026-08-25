@@ -1,0 +1,17 @@
+rows scanned          : 63796
+(dataset, ID_Set) groups: 3500
+impure groups (>1 distinct response): 3395
+  of which negative ID_Set          : 0
+worst impure groups (dataset, ID_Set) -> distinct responses:
+  ('lm arena', 2605) -> 24
+  ('lm arena', 1236) -> 24
+  ('lm arena', 3349) -> 24
+  ('lm arena', 1988) -> 24
+  ('lm arena', 2889) -> 24
+  ('lm arena', 2884) -> 24
+  ('lm arena', 510) -> 24
+  ('lm arena', 493) -> 24
+  ('lm arena', 3453) -> 24
+  ('lm arena', 687) -> 24
+
+VERDICT: labels UNRELIABLE — some ID_Set groups span multiple distinct answers, so ID_Set is NOT a clean correctness label. Use DEV-LOOP ONLY; do not use for any published number.

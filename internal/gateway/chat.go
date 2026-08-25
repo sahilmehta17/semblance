@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/sahilmehta17/semblance/internal/cache"
 	"github.com/sahilmehta17/semblance/internal/judge"
@@ -59,8 +60,12 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	var req openai.ChatCompletionRequest
 	_ = json.Unmarshal(body, &req)
 
+	key := apiKeyFrom(r.Context())
+	model := req.Model
+
 	// Caching entirely disabled (no embedder) → pure passthrough.
 	if s.embedder == nil {
+		s.countBypass("no_embedder")
 		w.Header().Set(headerCache, cacheBypass)
 		s.proxyPassthrough(w, r, body, &req)
 		return
@@ -68,7 +73,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// Bypass for request shapes we do not (or cannot) cache.
 	if reason := s.bypassReason(&req); reason != "" {
-		s.bypassTotal.Add(1)
+		s.countBypass(reason)
 		s.reqLogger(r).Debug("cache bypass", "reason", reason)
 		w.Header().Set(headerCache, cacheBypass)
 		s.proxyPassthrough(w, r, body, &req)
@@ -78,38 +83,58 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	finalText, _ := finalUserText(&req) // bypassReason guaranteed this is present
 	bucket := bucketKeyForRequest(&req)
 
-	qvec, err := s.embedder.Embed(r.Context(), finalText)
+	qvec, embTokens, err := s.embedder.Embed(r.Context(), finalText)
 	if err != nil {
 		// Can't embed → can't cache. Fall back to a plain proxied miss.
 		s.reqLogger(r).Warn("embed failed; passthrough without caching", "err", err)
+		s.countBypass("embed_error")
 		w.Header().Set(headerCache, cacheMiss)
 		s.proxyPassthrough(w, r, body, &req)
 		return
 	}
+	// An embedding happens on hits and misses alike (to find the neighbor).
+	s.recordEmbedUsage(model, key, embTokens)
 
 	match, found := s.store.Nearest(bucket, qvec)
 	if !found {
-		s.exploreColdMiss(w, r, body, bucket, qvec)
+		s.metrics.RequestsTotal.WithLabelValues("explore").Inc()
+		s.exploreColdMiss(w, r, body, bucket, qvec, model, key)
 		return
 	}
 
-	// A neighbor exists: let the policy decide. Decide() draws u internally
-	// from the injected RNG, so this single call covers "get tau_hat, draw u,
-	// explore-or-exploit".
+	// Neighbor found: record the observable signals, then let the policy decide.
+	// Decide() draws u internally from the injected RNG, so this single call
+	// covers "get tau_hat, draw u, explore-or-exploit". We time it as the refit
+	// cost (the logistic fit dominates).
+	s.metrics.Similarity.Observe(match.Similarity)
+	s.metrics.EntryObs.Observe(float64(len(match.Observations)))
+	start := time.Now()
 	decision := s.policy.Decide(match.Observations, match.Similarity)
+	s.metrics.RefitSeconds.Observe(time.Since(start).Seconds())
+	s.metrics.Tau.Observe(decision.Tau)
+
 	w.Header().Set(headerSimilarity, formatFloat(match.Similarity))
 	w.Header().Set(headerTau, formatFloat(decision.Tau))
 
 	if decision.Explore {
-		s.exploreWithNeighbor(w, r, body, bucket, qvec, match)
+		s.metrics.RequestsTotal.WithLabelValues("explore").Inc()
+		s.exploreWithNeighbor(w, r, body, bucket, qvec, match, model, key)
 		return
 	}
-	s.serveHit(w, r, match)
+	s.metrics.RequestsTotal.WithLabelValues("exploit").Inc()
+	s.serveHit(w, r, match, model)
+}
+
+// countBypass records a bypass in both the legacy atomic counter and Prometheus.
+func (s *Server) countBypass(reason string) {
+	s.bypassTotal.Add(1)
+	s.metrics.BypassTotal.WithLabelValues(reason).Inc()
+	s.metrics.RequestsTotal.WithLabelValues("bypass").Inc()
 }
 
 // serveHit returns the cached response (EXPLOIT). Learning happens only on
 // EXPLORE, so we do not record an observation here.
-func (s *Server) serveHit(w http.ResponseWriter, r *http.Request, match cache.Match) {
+func (s *Server) serveHit(w http.ResponseWriter, r *http.Request, match cache.Match, model string) {
 	w.Header().Set(headerCache, cacheHit)
 	ct := match.Response.ContentType
 	if ct == "" {
@@ -118,13 +143,15 @@ func (s *Server) serveHit(w http.ResponseWriter, r *http.Request, match cache.Ma
 	w.Header().Set("Content-Type", ct)
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(match.Response.Body)
+	// The modeled cost of the backend call this hit avoided.
+	s.recordSavedCost(model, match.Response.Body)
 	s.reqLogger(r).Info("cache hit", "similarity", match.Similarity)
 }
 
 // exploreColdMiss handles an empty bucket: there is no neighbor, so we must
 // call the backend and (on success) insert this prompt as the bucket's first
 // entry — unconditionally, since there is nothing to guard against.
-func (s *Server) exploreColdMiss(w http.ResponseWriter, r *http.Request, body []byte, bucket string, qvec []float32) {
+func (s *Server) exploreColdMiss(w http.ResponseWriter, r *http.Request, body []byte, bucket string, qvec []float32, model, key string) {
 	w.Header().Set(headerCache, cacheMiss)
 	w.Header().Set(headerTau, "1") // forced explore (cold start), no neighbor
 
@@ -136,6 +163,7 @@ func (s *Server) exploreColdMiss(w http.ResponseWriter, r *http.Request, body []
 	s.writeBuffered(w, res)
 
 	if res.cacheable() {
+		s.recordBackendUsage(model, key, res.body)
 		s.store.Insert(bucket, qvec, cache.StoredResponse{
 			Body:        res.body,
 			ContentType: res.contentType,
@@ -149,7 +177,7 @@ func (s *Server) exploreColdMiss(w http.ResponseWriter, r *http.Request, body []
 // neighbor's answer would have been correct and update the cache per
 // Algorithm 1 (append observation; guarded-insert only when the neighbor was
 // wrong).
-func (s *Server) exploreWithNeighbor(w http.ResponseWriter, r *http.Request, body []byte, bucket string, qvec []float32, match cache.Match) {
+func (s *Server) exploreWithNeighbor(w http.ResponseWriter, r *http.Request, body []byte, bucket string, qvec []float32, match cache.Match, model, key string) {
 	w.Header().Set(headerCache, cacheMiss)
 
 	res, err := s.fetchUpstreamBuffered(r, body)
@@ -162,6 +190,8 @@ func (s *Server) exploreWithNeighbor(w http.ResponseWriter, r *http.Request, bod
 	if !res.cacheable() {
 		return
 	}
+	s.recordBackendUsage(model, key, res.body)
+
 	newResp := cache.StoredResponse{
 		Body:        res.body,
 		ContentType: res.contentType,
@@ -173,10 +203,15 @@ func (s *Server) exploreWithNeighbor(w http.ResponseWriter, r *http.Request, bod
 
 	// Off the critical path: judge equivalence, then record the observation and
 	// guarded-insert. Dropped if the queue is full (safe: we just learn less).
+	// The label also feeds the honest observable proxy: judge-observed c=0 rate.
 	s.labeler.Submit(judge.Job{
 		Reference: reference,
 		Candidate: newResp.Content,
 		OnResult: func(equivalent bool) {
+			s.metrics.ExploresLabel.Inc()
+			if !equivalent {
+				s.metrics.ExploresC0.Inc()
+			}
 			s.store.Observe(bucket, entryID, sim, equivalent)
 			cache.GuardedInsert(s.store, bucket, qvec, newResp, equivalent)
 		},

@@ -1,0 +1,21 @@
+{
+  "retrieved_date": "2026-08-25",
+  "currency": "USD",
+  "_note": "Per-million-token list prices. Retrieved date is committed so a stale table is obvious. Update both prices and retrieved_date together.",
+  "models": {
+    "llama-3.3-70b-versatile": {
+      "prompt_per_1m": 0.59,
+      "completion_per_1m": 0.79
+    },
+    "llama3.2:1b": {
+      "prompt_per_1m": 0.0,
+      "completion_per_1m": 0.0
+    },
+    "text-embedding-3-small": {
+      "embed_per_1m": 0.02
+    },
+    "text-embedding-3-large": {
+      "embed_per_1m": 0.13
+    }
+  }
+}

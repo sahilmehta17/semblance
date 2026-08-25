@@ -13,7 +13,7 @@ var fake = embed.NewFake(256)
 
 func emb(t *testing.T, text string) []float32 {
 	t.Helper()
-	v, err := fake.Embed(context.Background(), text)
+	v, _, err := fake.Embed(context.Background(), text)
 	if err != nil {
 		t.Fatalf("embed: %v", err)
 	}

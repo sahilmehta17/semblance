@@ -23,7 +23,18 @@ type ctxKey int
 const (
 	ctxKeyRequestID ctxKey = iota
 	ctxKeyLogger
+	ctxKeyAPIKey
 )
+
+// anonymousKey is the budget/metrics bucket used when auth is in open mode (no
+// keys configured) but budgets are still enabled.
+const anonymousKey = "anonymous"
+
+// apiKeyFrom returns the authenticated API key on the context, or "" if none.
+func apiKeyFrom(ctx context.Context) string {
+	k, _ := ctx.Value(ctxKeyAPIKey).(string)
+	return k
+}
 
 // RequestIDFrom returns the request ID stored on the context, or "" if none.
 func RequestIDFrom(ctx context.Context) string {
@@ -168,13 +179,32 @@ func (s *Server) accessLogMiddleware(next http.Handler) http.Handler {
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if len(s.cfg.APIKeys) == 0 {
-			next.ServeHTTP(w, r)
+			// Open mode: no auth. Bill any budget/metrics to a shared bucket.
+			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKeyAPIKey, anonymousKey)))
 			return
 		}
 		token, ok := bearerToken(r.Header.Get("Authorization"))
 		if !ok || !keyAllowed(s.cfg.APIKeys, token) {
 			writeError(w, http.StatusUnauthorized, "invalid_request_error", "invalid or missing API key")
 			return
+		}
+		// Stash the authenticated key so budget and cost accounting can bill it.
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKeyAPIKey, token)))
+	})
+}
+
+// budgetMiddleware rejects requests from an over-budget key with 429 before any
+// work is done. It runs inside authMiddleware, so the key is already on the
+// context. A no-op when budgets are disabled (ceiling 0).
+func (s *Server) budgetMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.budget.Enabled() {
+			key := apiKeyFrom(r.Context())
+			if s.budget.OverBudget(key) {
+				writeError(w, http.StatusTooManyRequests, "insufficient_quota",
+					"spend limit exceeded for this API key")
+				return
+			}
 		}
 		next.ServeHTTP(w, r)
 	})

@@ -25,8 +25,8 @@ func cosine(a, b []float32) float64 {
 
 func TestFakeDeterministic(t *testing.T) {
 	f := NewFake(256)
-	a, _ := f.Embed(context.Background(), "the capital of france")
-	b, _ := f.Embed(context.Background(), "the capital of france")
+	a, _, _ := f.Embed(context.Background(), "the capital of france")
+	b, _, _ := f.Embed(context.Background(), "the capital of france")
 	if cosine(a, b) != 1.0 {
 		t.Errorf("same text should embed identically, cosine = %v", cosine(a, b))
 	}
@@ -37,7 +37,7 @@ func TestFakeDeterministic(t *testing.T) {
 func TestFakeSimilarityRelationships(t *testing.T) {
 	f := NewFake(512)
 	emb := func(s string) []float32 {
-		v, _ := f.Embed(context.Background(), s)
+		v, _, _ := f.Embed(context.Background(), s)
 		return v
 	}
 
@@ -67,21 +67,27 @@ func TestOpenAIEmbedderWireProtocol(t *testing.T) {
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		gotModel, gotInput = req.Model, req.Input
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(embeddingResponse{
+		resp := embeddingResponse{
 			Data: []struct {
 				Embedding []float32 `json:"embedding"`
 			}{{Embedding: []float32{0.1, 0.2, 0.3}}},
-		})
+		}
+		resp.Usage.PromptTokens = 7
+		resp.Usage.TotalTokens = 7
+		_ = json.NewEncoder(w).Encode(resp)
 	}))
 	defer srv.Close()
 
 	e := NewOpenAI(srv.URL+"/v1", "test-key", "text-embedding-3-small", 3, srv.Client())
-	vec, err := e.Embed(context.Background(), "hello world")
+	vec, tokens, err := e.Embed(context.Background(), "hello world")
 	if err != nil {
 		t.Fatalf("Embed error: %v", err)
 	}
 	if len(vec) != 3 {
 		t.Fatalf("got %d dims, want 3", len(vec))
+	}
+	if tokens != 7 {
+		t.Errorf("tokens = %d, want 7 (from usage)", tokens)
 	}
 	if gotAuth != "Bearer test-key" {
 		t.Errorf("Authorization = %q", gotAuth)
@@ -99,7 +105,7 @@ func TestOpenAIEmbedderErrorStatus(t *testing.T) {
 	defer srv.Close()
 
 	e := NewOpenAI(srv.URL+"/v1", "nope", "text-embedding-3-small", 1536, srv.Client())
-	if _, err := e.Embed(context.Background(), "x"); err == nil {
+	if _, _, err := e.Embed(context.Background(), "x"); err == nil {
 		t.Error("expected error on non-200 status, got nil")
 	}
 }

@@ -74,6 +74,13 @@ type Config struct {
 	EmbedBaseURL    string
 	EmbedModel      string
 	EmbedDimensions int
+
+	// --- Metrics, pricing, budgets ---
+
+	// PriceTablePath is the committed JSON price table (per-model, per-1M-token).
+	PriceTablePath string
+	// BudgetCents is the per-API-key spend ceiling in cents (0 = unlimited).
+	BudgetCents float64
 }
 
 // Load reads configuration from the environment and validates it.
@@ -154,6 +161,15 @@ func Load() (*Config, error) {
 	cfg.EmbedModel = getenv("SEMBLANCE_EMBED_MODEL", "text-embedding-3-small")
 	if cfg.EmbedDimensions, err = parsePositiveInt("SEMBLANCE_EMBED_DIMENSIONS", "1536"); err != nil {
 		return nil, err
+	}
+
+	// Metrics / pricing / budgets.
+	cfg.PriceTablePath = getenv("SEMBLANCE_PRICE_TABLE", "config/prices.json")
+	if cfg.BudgetCents, err = parseFloat("SEMBLANCE_BUDGET_CENTS", "0"); err != nil {
+		return nil, err
+	}
+	if cfg.BudgetCents < 0 {
+		return nil, fmt.Errorf("SEMBLANCE_BUDGET_CENTS: must be >= 0")
 	}
 
 	return cfg, nil

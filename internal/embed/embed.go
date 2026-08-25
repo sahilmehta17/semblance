@@ -11,9 +11,11 @@ import "context"
 // normalization for cosine similarity is the cache's responsibility, so callers
 // never have to remember to normalize.
 type Embedder interface {
-	// Embed returns the embedding of text. The returned slice length equals
-	// Dimensions().
-	Embed(ctx context.Context, text string) ([]float32, error)
+	// Embed returns the embedding of text and the number of tokens the provider
+	// billed for it (0 if the provider reports none). The returned slice length
+	// equals Dimensions(). Token counts come from the provider's usage field —
+	// they are never estimated — so cost accounting stays honest.
+	Embed(ctx context.Context, text string) (vec []float32, tokens int, err error)
 	// Dimensions is the vector length this embedder produces.
 	Dimensions() int
 }

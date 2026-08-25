@@ -1,0 +1,4 @@
+# Presentation-only: renders bench/results.json into the error-vs-hit plot.
+# Install into the prep venv: tools/prep/.venv/bin/python -m pip install -r tools/plot_requirements.txt
+# Pure-Go alternative (avoids Python entirely): gonum.org/v1/plot in the Go harness.
+matplotlib

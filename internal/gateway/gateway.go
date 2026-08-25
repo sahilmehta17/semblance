@@ -9,11 +9,14 @@ import (
 	"net/http"
 	"sync/atomic"
 
+	"github.com/sahilmehta17/semblance/internal/budget"
 	"github.com/sahilmehta17/semblance/internal/cache"
 	"github.com/sahilmehta17/semblance/internal/config"
 	"github.com/sahilmehta17/semblance/internal/embed"
 	"github.com/sahilmehta17/semblance/internal/judge"
+	"github.com/sahilmehta17/semblance/internal/metrics"
 	"github.com/sahilmehta17/semblance/internal/policy"
+	"github.com/sahilmehta17/semblance/internal/pricing"
 )
 
 // Server holds the dependencies every handler shares. The verified-cache
@@ -28,6 +31,9 @@ type Server struct {
 	store    cache.Store
 	policy   *policy.Policy
 	labeler  *judge.Labeler
+	metrics  *metrics.Metrics
+	prices   *pricing.Table
+	budget   *budget.Tracker
 
 	bypassTotal atomic.Int64
 }
@@ -46,6 +52,9 @@ func WithPolicy(p *policy.Policy) Option { return func(s *Server) { s.policy = p
 
 // WithLabeler injects the async labeler.
 func WithLabeler(l *judge.Labeler) Option { return func(s *Server) { s.labeler = l } }
+
+// WithPrices injects a price table (tests use a known one to check cost math).
+func WithPrices(p *pricing.Table) Option { return func(s *Server) { s.prices = p } }
 
 // stdRand adapts the standard library's concurrency-safe global RNG to
 // policy.Rand for production use.
@@ -80,6 +89,31 @@ func New(cfg *config.Config, logger *slog.Logger, opts ...Option) *Server {
 	if s.labeler == nil {
 		s.labeler = judge.NewLabeler(judge.NewDefaultJudge(nil), cfg.JudgeQueueSize, cfg.JudgeWorkers, logger)
 	}
+	if s.metrics == nil {
+		s.metrics = metrics.New()
+	}
+	if s.prices == nil {
+		// A missing/empty price table is a warning, not a fatal: the gateway
+		// still runs and simply reports costs of 0 for unpriced models.
+		if p, err := pricing.Load(cfg.PriceTablePath); err != nil {
+			logger.Warn("price table not loaded; costs will report 0", "path", cfg.PriceTablePath, "err", err)
+			s.prices = pricing.Empty()
+		} else {
+			s.prices = p
+			logger.Info("price table loaded", "path", cfg.PriceTablePath, "retrieved_date", p.RetrievedDate, "models", len(p.Models))
+		}
+	}
+	if s.budget == nil {
+		s.budget = budget.New(cfg.BudgetCents)
+	}
+
+	// The configured delta is the TARGET; realized error is not observable live
+	// (see metrics package doc / DECISIONS.md). Expose the target only.
+	s.metrics.DeltaTarget.Set(cfg.Delta)
+	// Gauges evaluated on each scrape, so they are correct even when idle.
+	s.metrics.RegisterCacheEntriesFunc(func() float64 { return float64(s.store.Len()) })
+	s.metrics.RegisterJudgeQueueFunc(func() float64 { return float64(s.labeler.QueueDepth()) })
+
 	if s.embedder == nil {
 		logger.Warn("no embedder configured (set OPENAI_API_KEY); semantic caching DISABLED (passthrough only)")
 	}
@@ -110,14 +144,18 @@ func (s *Server) Close() {
 // Routes use Go 1.22+ method-and-path patterns, so a wrong method on a known
 // path yields 405 automatically.
 func (s *Server) Handler() http.Handler {
-	// The /v1 subtree, guarded by auth.
+	// The /v1 subtree, guarded by auth then budget (auth sets the key on the
+	// context; budget reads it). Order: auth(budget(v1)).
 	v1 := http.NewServeMux()
 	v1.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
-	authedV1 := s.authMiddleware(v1)
+	authedV1 := s.authMiddleware(s.budgetMiddleware(v1))
 
-	// Root mux: unauthenticated health plus the guarded /v1 subtree.
+	// Root mux: unauthenticated health and metrics, plus the guarded /v1 subtree.
+	// /metrics is unauthenticated like /healthz so a Prometheus scraper needs no
+	// key (a common, deliberate choice; noted in DECISIONS.md).
 	root := http.NewServeMux()
 	root.HandleFunc("GET /healthz", s.handleHealthz)
+	root.Handle("GET /metrics", s.metrics.Handler())
 	root.Handle("/v1/", authedV1)
 
 	// Common middleware applied to all routes.

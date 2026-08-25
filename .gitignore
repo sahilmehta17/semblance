@@ -5,3 +5,9 @@
 tools/prep/.venv/
 # Large extracted datasets — never commit multi-GB data. Samples/ is committed.
 tools/prep/out/
+
+# Benchmark dev/validation artifacts and logs (headline results.json/csv + plot ARE committed)
+bench/*_run.log
+bench/results_dev.*
+bench/results_10k.*
+bench/diag_*

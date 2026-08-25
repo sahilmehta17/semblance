@@ -84,6 +84,10 @@ func (l *Labeler) Submit(job Job) bool {
 // Dropped returns how many jobs have been dropped due to a full queue.
 func (l *Labeler) Dropped() int64 { return l.dropped.get() }
 
+// QueueDepth returns the number of jobs currently waiting in the queue. Safe to
+// call concurrently (len on a channel is atomic).
+func (l *Labeler) QueueDepth() int { return len(l.queue) }
+
 // Close stops accepting new jobs and waits for in-flight jobs to finish. After
 // Close, Submit will panic (send on closed channel) — callers must stop
 // submitting first, which the gateway does during graceful shutdown.

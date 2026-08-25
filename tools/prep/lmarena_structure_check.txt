@@ -1,0 +1,44 @@
+rows scanned            : 63796
+
+-- response constancy (are responses placeholders?) --
+distinct response values: 60408
+      217 x "I'm sorry, but I can't assist with that request."
+       44 x 'Eiko Carol is approximately 6 years old at the beginning of "Final Fan'
+       41 x 'You will look for the bookmark on page 65, since your friend moved it '
+       26 x 'Project_B'
+       25 x 'True'
+
+-- id_set cluster structure --
+id_set groups           : 3500
+  singletons (size 1)   : 102
+  multi-member (size>=2): 3398
+  rows in multi clusters: 63694
+  largest cluster size  : 24
+  size histogram        : 1:102, 2:36, 3-5:109, 6-10:247, 11+:3006
+
+-- spot check: same id_set should be paraphrases --
+  id_set 2605 (24 members):
+      - >
+        "Are there instances where SI prefixes deviate from denoting powers of 10, exclu
+      - >
+Are there any instances where SI prefixes don't denote powers of 10, excluding their use
+      - >
+        Are there any instances where SI prefixes deviate from their standard definition
+  id_set 1118 (22 members):
+      - Determine the required sample size for a two-sided proportion test with a baseline proport
+      - >
+        Determine the required sample size for a two-sided proportion test with a baseli
+      - >
+        "determine required sample sizes for a two-tailed proportion test: baseline prop
+  id_set 2433 (18 members):
+      - Which shortcut forwarding engine is recommended, STP or CTF, and is it advisable to activa
+      - What is the most efficient shortcut forwarding engine to use (STP or CTF) and is it recomm
+      - Which shortcut forwarding engine is recommended, STP or CTF, and is it advisable to activa
+
+-- spot check: different id_set should differ --
+  id_set 2605: >
+        "Are there instances where SI prefixes deviate from denoting powers of 10, exclu
+  id_set 1118: Determine the required sample size for a two-sided proportion test with a baseline proport
+  id_set 2433: Which shortcut forwarding engine is recommended, STP or CTF, and is it advisable to activa
+
+VERDICT: responses are NOT constant (60408 distinct) — revisit assumptions. id_set is a usable clustering: 3398 multi-member clusters give real paraphrase pairs to hit.

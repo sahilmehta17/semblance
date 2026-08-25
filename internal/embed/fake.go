@@ -37,7 +37,9 @@ func NewFake(dim int) *Fake {
 
 func (f *Fake) Dimensions() int { return f.dim }
 
-func (f *Fake) Embed(_ context.Context, text string) ([]float32, error) {
+// Embed returns tokens=0: the fake makes no API call, so there is no real token
+// count to report, and estimating one would corrupt cost accounting.
+func (f *Fake) Embed(_ context.Context, text string) ([]float32, int, error) {
 	v := make([]float32, f.dim)
 	for _, tok := range strings.Fields(strings.ToLower(text)) {
 		h := fnv.New32a()
@@ -50,5 +52,5 @@ func (f *Fake) Embed(_ context.Context, text string) ([]float32, error) {
 			v[idx]++
 		}
 	}
-	return v, nil
+	return v, 0, nil
 }
