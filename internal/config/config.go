@@ -53,6 +53,10 @@ type Config struct {
 
 	// Delta is the policy's error budget (the only real hyperparameter).
 	Delta float64
+	// NMin is the cold-start floor: force EXPLORE until an entry has this many
+	// observations. The benchmark (DECISIONS.md) found 3 a good value; 5 is the
+	// conservative default.
+	NMin int
 	// TemperatureCeiling: requests above this temperature bypass the cache
 	// (high randomness makes a cached answer unreliable).
 	TemperatureCeiling float64
@@ -132,6 +136,9 @@ func Load() (*Config, error) {
 	}
 	if cfg.Delta <= 0 || cfg.Delta >= 1 {
 		return nil, fmt.Errorf("SEMBLANCE_DELTA: must be in (0,1), got %v", cfg.Delta)
+	}
+	if cfg.NMin, err = parsePositiveInt("SEMBLANCE_NMIN", "5"); err != nil {
+		return nil, err
 	}
 	if cfg.TemperatureCeiling, err = parseFloat("SEMBLANCE_TEMPERATURE_CEILING", "0.3"); err != nil {
 		return nil, err

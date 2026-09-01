@@ -1,0 +1,42 @@
+replicaCount: 1
+
+image:
+  repository: semblance
+  tag: local
+  # Never: use the image imported into k3s containerd; do not hit a registry.
+  pullPolicy: Never
+
+service:
+  type: ClusterIP
+  port: 8080
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: "1"
+    memory: 512Mi
+
+# Gateway configuration (rendered into a ConfigMap as SEMBLANCE_* env vars).
+config:
+  listenAddr: ":8080"
+  logLevel: "info"
+  # Ollama's OpenAI-compatible endpoint. Inside a pod, localhost is the pod, not
+  # the WSL host — override with the host IP for a live chat demo (see README).
+  backendURL: "http://host.docker.internal:11434/v1"
+  delta: "0.03"
+  nMin: "3"
+  temperatureCeiling: "0.3"
+  cacheCapacity: "10000"
+  maxObservations: "200"
+  budgetCents: "0" # 0 = unlimited
+
+# API keys for /v1 auth. Empty list = open mode (no auth) — fine for the local
+# k3s run. Rendered into a Secret as SEMBLANCE_API_KEYS (comma-separated).
+apiKeys: []
+
+# Liveness/readiness both probe /healthz (unauthenticated).
+probes:
+  initialDelaySeconds: 2
+  periodSeconds: 10

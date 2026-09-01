@@ -1,0 +1,13 @@
+semblance is installed as release "{{ .Release.Name }}".
+
+1. Watch the pod become Ready:
+   kubectl get pods -l app.kubernetes.io/instance={{ .Release.Name }} -w
+
+2. Port-forward and probe:
+   kubectl port-forward svc/{{ include "semblance.fullname" . }} 8080:{{ .Values.service.port }}
+   curl -s localhost:8080/healthz
+   curl -s localhost:8080/metrics | head
+
+Auth: {{ if .Values.apiKeys }}enabled ({{ len .Values.apiKeys }} key(s)){{ else }}OPEN MODE (no keys) — /v1 needs no token{{ end }}.
+Backend: {{ .Values.config.backendURL }}
+imagePullPolicy: {{ .Values.image.pullPolicy }} (image must be imported into k3s containerd).

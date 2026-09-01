@@ -1,0 +1,6 @@
+apiVersion: v2
+name: semblance
+description: Verified semantic caching LLM gateway (vCache, arXiv:2502.03771) as a Go gateway on Kubernetes.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

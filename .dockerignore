@@ -1,0 +1,11 @@
+# Keep the build context small: source + go.mod + config only.
+.git
+tools/prep/.venv
+tools/prep/out
+tools/prep/samples
+bench/*.json
+bench/*.csv
+bench/*.png
+bench/*.log
+*.md
+deploy

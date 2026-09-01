@@ -32,6 +32,7 @@ func testConfig(backendURL string, keys ...string) *config.Config {
 		BackendTimeout:     5 * time.Second,
 		APIKeys:            keys,
 		Delta:              0.05,
+		NMin:               3,
 		TemperatureCeiling: 0.3,
 		CacheCapacity:      1000,
 		MaxObservations:    128,

@@ -85,6 +85,9 @@ func New(cfg *config.Config, logger *slog.Logger, opts ...Option) *Server {
 	}
 	if s.policy == nil {
 		s.policy = policy.NewPolicy(cfg.Delta, stdRand{})
+		if cfg.NMin > 0 { // configurable cold-start floor (0 keeps the default)
+			s.policy.NMin = cfg.NMin
+		}
 	}
 	if s.labeler == nil {
 		s.labeler = judge.NewLabeler(judge.NewDefaultJudge(nil), cfg.JudgeQueueSize, cfg.JudgeWorkers, logger)

@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "semblance.fullname" . }}
+  labels:
+    {{- include "semblance.labels" . | nindent 4 }}
+data:
+  SEMBLANCE_LISTEN_ADDR: {{ .Values.config.listenAddr | quote }}
+  SEMBLANCE_LOG_LEVEL: {{ .Values.config.logLevel | quote }}
+  SEMBLANCE_BACKEND_URL: {{ .Values.config.backendURL | quote }}
+  SEMBLANCE_DELTA: {{ .Values.config.delta | quote }}
+  SEMBLANCE_NMIN: {{ .Values.config.nMin | quote }}
+  SEMBLANCE_TEMPERATURE_CEILING: {{ .Values.config.temperatureCeiling | quote }}
+  SEMBLANCE_CACHE_CAPACITY: {{ .Values.config.cacheCapacity | quote }}
+  SEMBLANCE_MAX_OBSERVATIONS: {{ .Values.config.maxObservations | quote }}
+  SEMBLANCE_BUDGET_CENTS: {{ .Values.config.budgetCents | quote }}

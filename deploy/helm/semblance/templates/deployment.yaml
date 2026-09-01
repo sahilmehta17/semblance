@@ -1,0 +1,53 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "semblance.fullname" . }}
+  labels:
+    {{- include "semblance.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "semblance.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "semblance.selectorLabels" . | nindent 8 }}
+      annotations:
+        # Roll the pod when config/keys change.
+        checksum/config: {{ .Values.config | toYaml | sha256sum }}
+        checksum/keys: {{ .Values.apiKeys | toYaml | sha256sum }}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+      containers:
+        - name: semblance
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: {{ include "semblance.fullname" . }}
+            - secretRef:
+                name: {{ include "semblance.fullname" . }}-keys
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: {{ .Values.probes.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.periodSeconds }}
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: {{ .Values.probes.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.periodSeconds }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
