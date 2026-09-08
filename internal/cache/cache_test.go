@@ -209,7 +209,7 @@ func TestBucketKeyLengthPrefixing(t *testing.T) {
 		t.Error("BucketKey must not collide on delimiter-ambiguous parts")
 	}
 	// Deterministic.
-	if BucketKey("x", "y") != BucketKey("x", "y") {
+	if a, b := BucketKey("x", "y"), BucketKey("x", "y"); a != b {
 		t.Error("BucketKey must be deterministic")
 	}
 }

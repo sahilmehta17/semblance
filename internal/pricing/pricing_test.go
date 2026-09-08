@@ -39,7 +39,7 @@ func TestEmbedCostHandComputed(t *testing.T) {
 func TestLoadFromFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "prices.json")
-	os.WriteFile(path, []byte(`{"retrieved_date":"2026-08-25","currency":"USD",
+	_ = os.WriteFile(path, []byte(`{"retrieved_date":"2026-08-25","currency":"USD",
 		"models":{"m":{"prompt_per_1m":1.0,"completion_per_1m":2.0}}}`), 0o644)
 
 	tbl, err := Load(path)

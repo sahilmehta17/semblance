@@ -62,7 +62,7 @@ func (o *OpenAI) Embed(ctx context.Context, text string) ([]float32, int, error)
 	if err != nil {
 		return nil, 0, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if resp.StatusCode != http.StatusOK {

@@ -135,7 +135,7 @@ func loadJSONL(path string, limit int) ([]record, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 1<<20), 8<<20) // lines hold 1024-float vectors
@@ -168,11 +168,11 @@ func writeCSV(path string, runs []runResult) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	w := bufio.NewWriter(f)
-	defer w.Flush()
+	defer func() { _ = w.Flush() }()
 
-	fmt.Fprintln(w, "arm,param,delta,nmin,n,tp,fp,exploits,explores,hit_rate,hit_ci_lo,hit_ci_hi,error_rate,error_ci_lo,error_ci_hi,entries_final,within_delta")
+	_, _ = fmt.Fprintln(w, "arm,param,delta,nmin,n,tp,fp,exploits,explores,hit_rate,hit_ci_lo,hit_ci_hi,error_rate,error_ci_lo,error_ci_hi,entries_final,within_delta")
 	// Stable order: static by threshold, then verified by delta.
 	sort.SliceStable(runs, func(i, j int) bool {
 		if runs[i].Arm != runs[j].Arm {
@@ -189,7 +189,7 @@ func writeCSV(path string, runs []runResult) error {
 			nmin = fmt.Sprintf("%d", r.NMin)
 			within = fmt.Sprintf("%t", r.WithinDelta)
 		}
-		fmt.Fprintf(w, "%s,%.4f,%s,%s,%d,%d,%d,%d,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%d,%s\n",
+		_, _ = fmt.Fprintf(w, "%s,%.4f,%s,%s,%d,%d,%d,%d,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%d,%s\n",
 			r.Arm, r.Param, delta, nmin, r.N, r.TP, r.FP, r.Exploits, r.Explores,
 			r.HitRate, r.HitLo, r.HitHi, r.ErrorRate, r.ErrorLo, r.ErrorHi, r.EntriesFinal, within)
 	}

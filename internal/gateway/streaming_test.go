@@ -26,7 +26,7 @@ func sseBackend(t *testing.T, n int, delay time.Duration) *httptest.Server {
 		}
 		flusher.Flush()
 		for i := 0; i < n; i++ {
-			fmt.Fprintf(w, "data: chunk %d\n\n", i)
+			_, _ = fmt.Fprintf(w, "data: chunk %d\n\n", i)
 			flusher.Flush()
 			time.Sleep(delay)
 		}
@@ -56,7 +56,7 @@ func TestStreamingIncrementalDelivery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if ct := resp.Header.Get("Content-Type"); !isEventStream(ct) {
 		t.Fatalf("Content-Type = %q, want text/event-stream", ct)
@@ -103,7 +103,7 @@ func TestStreamingClientCancelStopsUpstream(t *testing.T) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
 		flusher, _ := w.(http.Flusher)
-		fmt.Fprint(w, "data: start\n\n")
+		_, _ = fmt.Fprint(w, "data: start\n\n")
 		if flusher != nil {
 			flusher.Flush()
 		}
@@ -132,7 +132,7 @@ func TestStreamingClientCancelStopsUpstream(t *testing.T) {
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	// Read the first chunk so we know the stream is flowing before we cancel.
 	line, _ := bufio.NewReader(resp.Body).ReadString('\n')

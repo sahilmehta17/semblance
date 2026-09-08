@@ -271,7 +271,7 @@ func (s *Server) fetchUpstreamBuffered(r *http.Request, body []byte) (*upstreamR
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	b, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -307,7 +307,7 @@ func (s *Server) proxyPassthrough(w http.ResponseWriter, r *http.Request, body [
 		s.logAndWriteError(w, r, http.StatusBadGateway, "upstream_error", "failed to reach the model backend", err)
 		return
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	streaming := req.Stream || isEventStream(resp.Header.Get("Content-Type"))
 	s.reqLogger(r).Info("chat completion proxied",
